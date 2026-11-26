@@ -38,7 +38,7 @@ struct MobilePlayerView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var decidedCacheOrientation = false
     @State private var clock = PlayerClock()
-    @State private var tracks = MediaTracks()
+    private var tracks: MediaTracks { session.mediaTracks }
     @State private var importsSubtitleFile = false
     @State private var asksSubtitleAddress = false
     @State private var searchesSubtitles = false
@@ -86,9 +86,8 @@ struct MobilePlayerView: View {
     @State private var taps = PictureTaps()
     @State private var skipped: (forward: Bool, total: Double)?
     @State private var skippedTask: Task<Void, Never>?
-    /// Controls a tap just brought up let a second tap through to the picture, which may be a double tap.
-    @State private var settling = false
-    @State private var settleTask: Task<Void, Never>?
+    /// A single tap waits `PictureTaps.interval` for a second tap before toggling the controls (#2148).
+    @State private var tapTask: Task<Void, Never>?
     /// Sliding sideways across the picture: where the slide began.
     @State private var swipeStart: Double?
     /// Sliding up or down: the brightness on the left, the volume on the right, from where the slide began.
@@ -158,6 +157,7 @@ struct MobilePlayerView: View {
             // Two taps on a side skip, touching and holding plays faster, and sliding sideways seeks.
             PictureGestures(tap: tapped, hold: held, swipe: swiped, levels: slidesLevels) { wider in
                 guard !locked else { return }
+                cancelPendingTap()
                 withAnimation(.easeInOut(duration: 0.25)) { videoFill = wider ? .fill : .fit }
             }
             .playerBleed(!inline)
@@ -200,7 +200,7 @@ struct MobilePlayerView: View {
             }
             // Faded out, the controls take no touches (a view at opacity 0 isn't hit). Hit testing isn't turned off as they
             // fade: on iOS 17 that closes a menu opened from them, so the Subtitles menu shut 3 s after the last tap (#1449).
-            controls.opacity(chromeVisible && !locked ? 1 : 0).allowsHitTesting(!locked && !settling)
+            controls.opacity(chromeVisible && !locked ? 1 : 0).allowsHitTesting(!locked)
             if !inline { lockButton }
         }
         // In with a fade; out at once, so the first frame replaces the wait with no pause or crossfade.
@@ -225,6 +225,7 @@ struct MobilePlayerView: View {
             }
         }
         .onDisappear {
+            cancelPendingTap()
             clock.detach(); nowPlaying.stop(); tvBrowser.stop(); CastController.shared.detach()
             if let brightnessBefore { screen?.brightness = brightnessBefore }
         }
@@ -249,7 +250,6 @@ struct MobilePlayerView: View {
             guard let old else { return .impact(weight: .light) }
             return new.locked != old.locked ? .impact(weight: .medium) : new.rate != old.rate ? .selection : nil
         }
-        .task(id: clock.item.map(ObjectIdentifier.init)) { await tracks.load(clock.item) }
         .sensoryFeedback(.impact(weight: .medium), trigger: locked)
         // Full screen, the status bar stays hidden, controls or not: with it came the Dynamic Island's Now Playing
         // activity over the picture each time the controls showed (#1149). The controls have the time and battery of
@@ -283,6 +283,7 @@ struct MobilePlayerView: View {
     }
 
     private func keyboardAction(_ action: PlaybackKeyboard.Action) {
+        cancelPendingTap()
         switch action {
         case .playPause: session.togglePlayback(); poke()
         case .seek(let seconds): session.skip(seconds); poke()
@@ -347,17 +348,22 @@ struct MobilePlayerView: View {
             if showsLock { withAnimation(.easeOut(duration: 0.2)) { showsLock = false } } else { flashLock() }
             return
         }
+        tapTask?.cancel(); tapTask = nil
         let zone = PictureTaps.zone(x: x, width: width, seekable: doubleTapSkips && seekable && showsTransport && playingOn == nil && !pip.active)
         switch taps.tap(at: ProcessInfo.processInfo.systemUptime, in: zone, step: SkipInterval.seconds(skipInterval)) {
-        case .toggleControls:
-            let showing = !chromeVisible
-            toggleChrome()
-            if showing { settle(); clearLabels() }
+        case .wait:
+            tapTask = Task {
+                try? await Task.sleep(for: .seconds(PictureTaps.interval))
+                guard !Task.isCancelled, taps.settle() else { return }
+                tapTask = nil
+                let showing = !chromeVisible
+                toggleChrome()
+                if showing { clearLabels() }
+            }
         case .togglePlayback:
-            toggleChrome()
             session.togglePlayback()
         case .skip(let seconds, let total, _):
-            // Hidden whether the first tap showed the controls or hid them.
+            // Hidden whether the controls were up or not.
             hideChrome()
             session.skip(seconds)
             nowPlaying.update(title: channel.name, session: session)
@@ -370,14 +376,14 @@ struct MobilePlayerView: View {
         }
     }
 
-    /// For as long as a second tap would make a double tap, it reaches the picture rather than the controls it showed.
-    private func settle() {
-        settling = true
-        settleTask?.cancel()
-        settleTask = Task {
-            try? await Task.sleep(for: .seconds(PictureTaps.interval))
-            if !Task.isCancelled { settling = false }
-        }
+    private func cancelPendingTap() {
+        tapTask?.cancel(); tapTask = nil
+        taps.cancel()
+    }
+
+    private func keepChrome() {
+        cancelPendingTap()
+        poke()
     }
 
     /// A gesture's label has the picture to itself: the controls make way, unless loading or a failure keeps them up.
@@ -398,12 +404,14 @@ struct MobilePlayerView: View {
         if locked, case .began = phase { return }
         switch phase {
         case .began(.seek):
+            cancelPendingTap()
             guard showsTransport, seekable, clock.duration > 0, playingOn == nil, !pip.active else { return }
             let start = clock.currentPosition
             swipeStart = start
             clock.scrub(to: start)
             hideChrome()
         case .began(let slide):
+            cancelPendingTap()
             let volume = slide == .volume
             guard volume || screen != nil else { return }
             keyboardVolume = nil
@@ -585,12 +593,13 @@ struct MobilePlayerView: View {
         .padding(right ? .trailing : .leading, 16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: right ? .trailing : .leading)
         .opacity(visible ? 1 : 0)
-        .allowsHitTesting(visible && !settling)
+        .allowsHitTesting(visible)
         .animation(.easeOut(duration: 0.2), value: visible)
     }
 
     private func setLocked(_ lock: Bool) {
         guard lock != locked else { return }
+        cancelPendingTap()
         lockTask?.cancel()
         withAnimation(.easeOut(duration: 0.2)) { locked = lock }
         if lock {
@@ -624,6 +633,7 @@ struct MobilePlayerView: View {
         switch phase {
         case .began:
             guard boosts, !locked, SpeedBoost.isOn(holdSpeed) else { return }
+            cancelPendingTap()
             keyboardBoost = false
             // A new hold replaces a kept speed: it ends with the finger unless slid down again.
             let started = SpeedBoost(rate: holdSpeed)
@@ -740,7 +750,7 @@ struct MobilePlayerView: View {
                 Spacer(minLength: 0)
                 HStack(spacing: 0) { toolbar; optionsMenu }.chromeGroup()
             }
-            .simultaneousGesture(TapGesture().onEnded { poke() })
+            .simultaneousGesture(TapGesture().onEnded { keepChrome() })
         } else {
             screenTopRow
         }
@@ -767,7 +777,7 @@ struct MobilePlayerView: View {
             }
             .chromeGroup()
         }
-        .simultaneousGesture(TapGesture().onEnded { poke() })
+        .simultaneousGesture(TapGesture().onEnded { keepChrome() })
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { topRowHeight = $0 }
     }
 
@@ -785,7 +795,7 @@ struct MobilePlayerView: View {
             if showsTags {
                 PlaybackBadges(session: session, active: chromeVisible) {
                     withAnimation(.smooth(duration: 0.25)) { showsPlaybackInfo.toggle() }
-                    poke()
+                    keepChrome()
                 }
             }
         }
@@ -882,19 +892,10 @@ struct MobilePlayerView: View {
             // The item's own subtitles, then subtitle files beside the video or added now (#576). A drive's transcoded
             // copy has none of the file's: the menu says why (#1343).
             Menu(L10n.text("Subtitles")) {
-                if let legible = tracks.legible, !legible.options.isEmpty {
-                    Picker(L10n.text("Subtitles"), selection: Binding(get: { session.externalSubtitles.selected == nil ? tracks.selected(in: legible) : nil },
-                                                                      set: { tracks.select($0, in: legible); session.choseSubtitle($0); session.externalSubtitles.nativeChosen() })) {
-                        if legible.group.allowsEmptySelection { Text(L10n.text("Off")).tag(AVMediaSelectionOption?.none) }
-                        ForEach(legible.options, id: \.self) { Text(legible.name($0)).tag(Optional($0)) }
-                    }
-                    .pickerStyle(.inline)
-                } else if session.externalSubtitles.selected != nil {
-                    Button(L10n.text("Off")) { session.externalSubtitles.select(nil) }
-                }
+                EmbeddedSubtitlePicker(session: session)
                 ExternalSubtitleMenu(subtitles: session.externalSubtitles, addFile: { importsSubtitleFile = true }, addAddress: { asksSubtitleAddress = true },
                                      searchOnline: { searchesSubtitles = true })
-                if session.playsDriveCopy { Text(L10n.text(Self.driveCopyNote)) }
+                if session.playsDriveCopy { Text(L10n.text(ExternalSubtitles.driveCopyNote)) }
             }
             if session.externalSubtitles.selected == nil, let legible = tracks.legible, !legible.options.isEmpty {
                 // A subtitle file that runs ahead of its picture (#599): each step holds it back half a second.
@@ -951,7 +952,6 @@ struct MobilePlayerView: View {
     }
 
     private static let speeds: [Float] = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4]
-    static let driveCopyNote = "The drive plays only a compressed copy of this video for this account, without its own subtitles. Use Search Online to add some."
     private static func speedLabel(_ speed: Float) -> String {
         Double(speed).formatted(.number.precision(.fractionLength(0...2))) + "×"
     }
@@ -980,7 +980,7 @@ struct MobilePlayerView: View {
                     .accessibilityLabel(L10n.text("Forward %@ seconds", String(Int(step))))
             }
         }
-        .simultaneousGesture(TapGesture().onEnded { poke() })
+        .simultaneousGesture(TapGesture().onEnded { keepChrome() })
     }
 
     /// Previous and Next Episode, small and at the right of the time above the seek bar. Beside ±10 and play, a tap
@@ -1054,7 +1054,7 @@ struct MobilePlayerView: View {
                         .accessibilityIdentifier("player.fullScreen")
                 }
             }
-            .simultaneousGesture(TapGesture().onEnded { poke() })
+            .simultaneousGesture(TapGesture().onEnded { keepChrome() })
         }
     }
 
@@ -1089,7 +1089,7 @@ struct MobilePlayerView: View {
             }
         } else if session.hasTimeline {
             // Dragging holds the controls up itself (`hold`); a tap gesture here would compete with the scrubber's drag.
-            SeekBar(clock: clock, moving: chromeVisible && !session.paused, hold: { scrubbingBar = $0; hold($0) }, sought: sought,
+            SeekBar(clock: clock, moving: chromeVisible && !session.paused, hold: { if $0 { cancelPendingTap() }; scrubbingBar = $0; hold($0) }, sought: sought,
                     marks: session.chapters.map(\.start)) { stepButtons }
                 // Gone mid-drag (the next episode began): what made way for the frame comes back.
                 .onDisappear { scrubbingBar = false }
@@ -1103,7 +1103,7 @@ struct MobilePlayerView: View {
 
     /// The position moved by a button or the seek bar: the Lock Screen follows.
     private func sought() {
-        poke()
+        keepChrome()
         nowPlaying.update(title: channel.name, session: session)
     }
 
@@ -2132,58 +2132,6 @@ private struct BatteryGauge: View {
         let end = range.map { CMTimeRangeGetEnd($0).seconds } ?? 0
         let value = end.isFinite ? max(0, end) : 0
         if abs(value - buffered) >= 1 || (value == 0) != (buffered == 0) { buffered = value }
-    }
-}
-
-/// The item's audio tracks and subtitles, for the options menu.
-@MainActor @Observable final class MediaTracks {
-    struct Group {
-        let group: AVMediaSelectionGroup
-        let options: [AVMediaSelectionOption]
-        /// The menu's names for them (`TrackLabel`): the language and what else is known, not just the language.
-        let names: [AVMediaSelectionOption: String]
-        init(group: AVMediaSelectionGroup, options: [AVMediaSelectionOption], details: [String: TrackDetail]) {
-            self.group = group; self.options = options
-            let labels = TrackLabel.names(options.map { option in
-                let title = AVMetadataItem.metadataItems(from: option.commonMetadata, filteredByIdentifier: .commonIdentifierTitle).first?.stringValue
-                let detail = title.flatMap { details[$0] }
-                return TrackLabel.Option(displayName: option.displayName, language: option.extendedLanguageTag ?? option.locale?.identifier,
-                                         title: detail?.title ?? title, format: detail?.format)
-            })
-            names = Dictionary(zip(options, labels)) { first, _ in first }
-        }
-        func name(_ option: AVMediaSelectionOption) -> String { names[option] ?? option.displayName }
-    }
-    private(set) var audio: Group?
-    private(set) var legible: Group?
-    /// Bumped by a selection, so the menus show the new choice.
-    private var revision = 0
-    @ObservationIgnored private weak var item: AVPlayerItem?
-
-    func load(_ item: AVPlayerItem?) async {
-        self.item = item; audio = nil; legible = nil
-        guard let item else { return }
-        let asset = item.asset
-        let audible = try? await asset.loadMediaSelectionGroup(for: .audible)
-        let subtitles = try? await asset.loadMediaSelectionGroup(for: .legible)
-        guard !Task.isCancelled, self.item === item else { return }
-        // A repackaged file's tracks: their titles and formats, which the options don't carry.
-        let details = (asset as? AVURLAsset).map { Remux.trackDetails($0.url) } ?? (audio: [:], subtitles: [:])
-        audio = audible.map { Group(group: $0, options: $0.options, details: details.audio) }
-        // Forced subtitles only translate foreign speech and come on by themselves; they aren't a choice.
-        legible = subtitles.map { group in
-            Group(group: group, options: group.options.filter { !$0.hasMediaCharacteristic(.containsOnlyForcedSubtitles) }, details: details.subtitles)
-        }
-    }
-
-    func selected(in group: Group) -> AVMediaSelectionOption? {
-        _ = revision
-        return item?.currentMediaSelection.selectedMediaOption(in: group.group)
-    }
-
-    func select(_ option: AVMediaSelectionOption?, in group: Group) {
-        item?.select(option, in: group.group)
-        revision += 1
     }
 }
 

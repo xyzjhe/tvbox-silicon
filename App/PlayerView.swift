@@ -58,6 +58,9 @@ struct PlaybackView: View {
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    /// With Start in Full Screen on, a player that opens as its own screen (a Discover search, say, rather than a
+    /// watch page) turns for the video the moment its picture appears. Watch pages apply it on their own.
+    @AppStorage(WatchPage.fullScreenKey) private var startsFullScreen = false
     #endif
 
     private var chromeVisible: Bool {
@@ -84,7 +87,7 @@ struct PlaybackView: View {
                                  next: episodeAction(store.step(back: false, from: channel, session: session)), waiting: waitContent,
                                  enhancer: session.enhancer, upscale: $upscalesVideo, smooth: $smoothsVideo, info: $showsPlaybackInfo,
                                  speed: playbackSpeed, setSpeed: { playbackSpeed = $0; session.setSpeed($0) }, fills: $fillsScreen, danmakuArea: $danmakuArea,
-                                 external: session.externalSubtitles, ownSubtitles: session.hasOwnSubtitles, skip: session.skipOffer, skipSource: { session.skipSourceSegment() },
+                                 external: session.externalSubtitles, ownSubtitles: session.hasOwnSubtitles, chooseSubtitle: session.chooseSubtitle, skip: session.skipOffer, skipSource: { session.skipSourceSegment() },
                                  skipping: session.canSkip ? session.skipSettings : nil, setSkipping: { session.applySkipSettings($0) },
                                  markSkip: { session.markSkip(intro: $0) },
                                  chapters: session.chapters,
@@ -214,6 +217,13 @@ struct PlaybackView: View {
         .onChange(of: channel) { _, channel in startCatalogPlayback(session, channel: channel, store: store); showOnStart(opening: false) }
         #if os(iOS)
         .onChange(of: session.showsPicture || session.error != nil, initial: true) { _, started in watch?.started(started) }
+        // Start in Full Screen (#2097): a player that opened as its own screen turns as soon as its picture appears,
+        // as the watch page's player does. Watch pages apply the setting themselves, so only the standalone player.
+        .onChange(of: session.showsPicture) { _, showing in
+            guard showing, startsFullScreen, playerLayout == .screen, session.error == nil else { return }
+            let size = session.player.currentItem?.presentationSize ?? .zero
+            PlayerOrientation.set(landscape: size.height == 0 || size.width >= size.height)
+        }
         .onAppear { watch?.opened(session) }
         #endif
         .onChange(of: showsDanmaku) { _, value in session.catalogDanmaku.enabled = value }
@@ -368,15 +378,15 @@ struct PlaybackView: View {
                 .chromeButton()
                 .accessibilityLabel(L10n.text("Audio"))
             }
-            // Subtitle files beside the video, or added now (#576); the item's own are in AVKit's menu.
+            // Individual embedded tracks as well as subtitle files beside the video.
             Menu {
-                MacSubtitleFiles(subtitles: session.externalSubtitles, addFile: { importsSubtitleFile = true }, addAddress: { asksSubtitleAddress = true },
+                MacSubtitleFiles(session: session, addFile: { importsSubtitleFile = true }, addAddress: { asksSubtitleAddress = true },
                                  searchOnline: { searchesSubtitles = true })
             } label: {
                 Image(systemName: session.externalSubtitles.selected == nil ? "captions.bubble" : "captions.bubble.fill").font(.headline).frame(width: 22, height: 22)
             }
             .chromeButton()
-            .accessibilityLabel(L10n.text("Subtitle Files"))
+            .accessibilityLabel(L10n.text("Subtitles"))
             // Settings stay reachable before comments load, including when automatic matching found none.
             Menu {
                 Toggle(isOn: $showsDanmaku) { Label(L10n.text("Show Danmaku"), systemImage: "text.bubble") }
@@ -857,6 +867,7 @@ private struct NativePlayerView: UIViewControllerRepresentable {
     var external: ExternalSubtitles? = nil
     /// The item has subtitle tracks of its own: Subtitle Files says where they are (#1524).
     var ownSubtitles = false
+    var chooseSubtitle: ((AVMediaSelectionOption?, AVMediaSelectionGroup) -> Void)?
     /// The source's opening or ending credits playing now, offered as AVKit's Skip button (#256).
     var skip: PlaybackSkip? = nil
     var skipSource: @MainActor () -> Void = {}
@@ -890,6 +901,13 @@ private struct NativePlayerView: UIViewControllerRepresentable {
         var exit: (() -> Void)?
         var subtitles: SubtitleCues?
         var transportBar: TransportBarVisibility?
+        var chooseSubtitle: ((AVMediaSelectionOption?, AVMediaSelectionGroup) -> Void)?
+        #if os(tvOS)
+        func playerViewController(_ playerViewController: AVPlayerViewController, didSelect mediaSelectionOption: AVMediaSelectionOption?,
+                                  in mediaSelectionGroup: AVMediaSelectionGroup) {
+            chooseSubtitle?(mediaSelectionOption, mediaSelectionGroup)
+        }
+        #endif
         func playerViewController(_ controller: AVPlayerViewController, willTransitionToVisibilityOfTransportBar visible: Bool,
                                   with coordinator: AVPlayerViewControllerAnimationCoordinator) {
             transportBar?.visible = visible
@@ -942,6 +960,7 @@ private struct NativePlayerView: UIViewControllerRepresentable {
         let gravity: AVLayerVideoGravity = fills.wrappedValue ? .resizeAspectFill : .resizeAspect
         if controller.videoGravity != gravity { controller.videoGravity = gravity }
         context.coordinator.host?.rootView = overlay
+        context.coordinator.chooseSubtitle = chooseSubtitle
         context.coordinator.exit = exitWhileWaiting
         context.coordinator.back.isEnabled = exitWhileWaiting != nil
         // The episodes, the chapters and the comment list are tabs in the info panel (swipe down), beside the video's own info.
@@ -1977,8 +1996,11 @@ private struct DesktopOptionsMenu: View, Equatable {
             if session.qualities.count > 1 {
                 Menu(L10n.text("Quality")) { QualityPicker(session: session) }
             }
-            Menu(L10n.text("Subtitle Files")) {
-                MacSubtitleFiles(subtitles: session.externalSubtitles, addFile: { importsSubtitleFile = true }, addAddress: { asksSubtitleAddress = true },
+            // Audio with full TrackLabel details: AVPlayerView's own menu names tracks by language alone, so several
+            // Chinese tracks all read "中文" (#2204).
+            MediaAudioMenus(session: session)
+            Menu(L10n.text("Subtitles")) {
+                MacSubtitleFiles(session: session, addFile: { importsSubtitleFile = true }, addAddress: { asksSubtitleAddress = true },
                                  searchOnline: { searchesSubtitles = true })
             }
             Menu(L10n.text("Danmaku")) {
@@ -2014,15 +2036,15 @@ private struct DesktopOptionsMenu: View, Equatable {
     }
 }
 
-/// The Mac's subtitle-file menu: AVKit's own menu has the item's subtitles, so this one has Off and the files.
+/// Embedded tracks and external files share one menu in both Mac player windows.
 private struct MacSubtitleFiles: View {
-    let subtitles: ExternalSubtitles
+    let session: PlaybackSession
     let addFile: () -> Void
     let addAddress: () -> Void
     let searchOnline: () -> Void
     var body: some View {
-        if subtitles.selected != nil { Button(L10n.text("Off")) { subtitles.select(nil) } }
-        ExternalSubtitleMenu(subtitles: subtitles, addFile: addFile, addAddress: addAddress, searchOnline: searchOnline)
+        EmbeddedSubtitlePicker(session: session)
+        ExternalSubtitleMenu(subtitles: session.externalSubtitles, addFile: addFile, addAddress: addAddress, searchOnline: searchOnline)
     }
 }
 
@@ -2133,6 +2155,32 @@ struct QualityPicker: View {
             ForEach(session.qualities) { Text($0.label).tag($0.id) }
         }
         .pickerStyle(.inline)
+    }
+}
+
+/// The Audio menus for the Mac options menu (#2204): the item's own tracks with `TrackLabel` details, or the choices a
+/// file offers that AVFoundation can't switch between (#428). iPhone and iPad have the same in their own menu.
+struct MediaAudioMenus: View {
+    let session: PlaybackSession
+
+    var body: some View {
+        if let audio = session.mediaTracks.audio, audio.options.count > 1 {
+            Menu(L10n.text("Audio")) {
+                Picker(L10n.text("Audio"), selection: Binding(get: { session.mediaTracks.selected(in: audio) },
+                                                              set: { session.mediaTracks.select($0, in: audio) })) {
+                    ForEach(audio.options, id: \.self) { Text(audio.name($0)).tag(Optional($0)) }
+                }
+                .pickerStyle(.inline)
+            }
+        }
+        if session.audioChoices.count > 1 {
+            Menu(L10n.text("Audio")) {
+                Picker(L10n.text("Audio"), selection: Binding(get: { session.audioChoice }, set: { if let id = $0 { session.chooseAudio(id) } })) {
+                    ForEach(session.audioChoices) { Text($0.name).tag(Optional($0.id)) }
+                }
+                .pickerStyle(.inline)
+            }
+        }
     }
 }
 #endif

@@ -159,7 +159,7 @@ struct DiscoverDetailView: View {
         .ignoresSafeArea(edges: .top)
         .navigationTitle("")
         #if os(macOS)
-        .artUnderToolbar()
+        .artUnderToolbar(dark ? .dark : .light)
         #else
         .toolbar(.visible, for: .navigationBar)
         .toolbarBackground(.hidden, for: .navigationBar)
@@ -236,7 +236,50 @@ struct DiscoverDetailView: View {
         return values.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
-    private var sourceButton: some View {
+    /// The most recent unfinished watch for this title, if any. Continue Playing takes the place of Search Sources,
+    /// which the page already does on its own, and carries on where the viewer stopped. iPhone only.
+    #if os(iOS)
+    private var resumeEntry: PlaybackHistoryEntry? {
+        let name = item.name
+        return store.playbackHistory.entries
+            .filter { !$0.completed }
+            // The same name only: a name inside another ("家" in "一家人", a first season in its sequel's "… 第二季") would
+            // carry on with a different title. Without one, Search Sources finds it.
+            .filter {
+                $0.context.videoName.trimmingCharacters(in: .whitespaces)
+                    .compare(name.trimmingCharacters(in: .whitespaces), options: [.caseInsensitive, .widthInsensitive]) == .orderedSame
+            }
+            .max(by: { $0.updatedAt < $1.updatedAt })
+    }
+    #endif
+
+    @ViewBuilder private var sourceButton: some View {
+        #if os(iOS)
+        if let entry = resumeEntry { continueButton(entry) } else { searchButton }
+        #else
+        searchButton
+        #endif
+    }
+
+    #if os(iOS)
+    private func continueButton(_ entry: PlaybackHistoryEntry) -> some View {
+        Button {
+            store.resume(entry)
+        } label: {
+            VStack(spacing: 3) {
+                Label(L10n.text("Continue Playing"), systemImage: "play.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                Text(HistoryFormat.status(entry)).font(.system(size: 12)).opacity(0.8)
+            }
+            .frame(maxWidth: .infinity).frame(height: 54)
+            .foregroundStyle(dark ? Color.black : Color.white)
+            .background(dark ? Color.white : Color.black, in: Capsule())
+        }
+        .buttonStyle(.plain).accessibilityIdentifier("discover.continuePlaying")
+    }
+    #endif
+
+    private var searchButton: some View {
         Button {
             episode = nil
             if store.subscription == nil { store.section = .settings }
@@ -648,7 +691,11 @@ private struct DiscoverMacSeasonButton: View {
         search.onResult = { [weak self] in self?.absorb($0) }
         if search.keyword.isEmpty {
             let hidden = store.hiddenSources
-            search.search(keyword, config: config) { hidden.contains($0, origin: config.origin) }
+            // A title is a film or a series. A listening source's album or chapter with the same name is not
+            // it, and its episodes open in the music player, so those sources are not asked (#2293).
+            search.search(keyword, config: config) { site in
+                hidden.contains(site, origin: config.origin) || AudioSources.isCandidate(site)
+            }
             // Answered from the model's own cache, the results are in already.
             search.results.forEach(absorb)
         } else if search.suspended {

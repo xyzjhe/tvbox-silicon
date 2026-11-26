@@ -16,7 +16,7 @@ struct WatchNowPhonePage: View {
     /// The newest titles not finished yet, for the hero.
     private var upNext: [PlaybackHistoryEntry] {
         guard sections.contains(.upNext) else { return [] }
-        return Array(store.playbackHistory.entries.filter { !$0.completed }.prefix(5))
+        return Array(store.visibleHistory.filter { !$0.completed }.prefix(5))
     }
 
     var body: some View {
@@ -66,16 +66,19 @@ struct WatchNowPhonePage: View {
         #endif
         .ignoresSafeArea(edges: entries.isEmpty ? [] : .top)
         #if os(macOS)
-        .heroUnderToolbar(!entries.isEmpty && !pastHero)
+        .heroUnderToolbar(!entries.isEmpty && !pastHero, scheme: hero.paint.map { $0.isDark ? .dark : .light })
         #endif
     }
 
     @ViewBuilder private var rows: some View {
-        if sections.contains(.continueWatching), !store.playbackHistory.entries.isEmpty {
-            WatchNowPhoneShelf(title: L10n.text("Continue Watching"), action: { openSection(.history) }) {
-                ForEach(store.playbackHistory.entries.prefix(12)) { HistoryCard(entry: $0) }
+        if sections.contains(.continueWatching) {
+            let history = store.visibleHistory
+            if !history.isEmpty {
+                WatchNowPhoneShelf(title: L10n.text("Continue Watching"), action: { openSection(.history) }) {
+                    ForEach(history.prefix(12)) { HistoryCard(entry: $0) }
+                }
+                .accessibilityIdentifier("home.continueWatching")
             }
-            .accessibilityIdentifier("home.continueWatching")
         }
         if sections.contains(.pinnedSources) {
             let pinned = store.orderedSites(config).filter { store.pinnedSources.contains($0, origin: config.origin) }
