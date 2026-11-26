@@ -1,8 +1,8 @@
-#if os(iOS)
 import SwiftUI
 import AVKit
-import MediaPlayer
 import TVCore
+#if os(iOS)
+import MediaPlayer
 
 /// The iPhone and iPad player. The picture plays in a layer of our own and every control is drawn here: AVKit's
 /// controls on iOS keep AirPlay and volume in a row of their own above anything laid over them and take no buttons
@@ -272,6 +272,8 @@ struct MobilePlayerView: View {
             CatalogDanmakuSettingsView(model: session.catalogDanmaku, channelName: channel.name).playerSheet().environment(store)
         }
         .sheet(isPresented: $showsSkip) { EpisodeSkipSettingsView(session: session).playerSheet().environment(store) }
+        // A sheet or prompt over the player holds the controls, as the seek bar does while held (#2341).
+        .onChange(of: presentationOpen) { _, open in hold(open) }
     }
 
     // MARK: Hardware keyboard
@@ -280,6 +282,15 @@ struct MobilePlayerView: View {
         UIDevice.current.userInterfaceIdiom == .pad && scenePhase == .active && !locked && !pip.active && playingOn == nil
             && !importsSubtitleFile && !asksSubtitleAddress && !searchesSubtitles && !showsEpisodes && !showsChannels
             && !showsDanmakuList && !showsDanmakuSettings && !showsSkip
+    }
+
+    /// A sheet or prompt opened from the controls: the controls stay until it closes, then count down again (#2341).
+    /// The hide timer only knows the context menu (`OpenMenu`); a sheet over the player left the controls to fade
+    /// under it, so the viewer came back to a bare picture. The same set the hardware keyboard treats as "something
+    /// is presented" (`keyboardEnabled`).
+    private var presentationOpen: Bool {
+        showsDanmakuList || showsDanmakuSettings || showsSkip || showsEpisodes || showsChannels
+            || importsSubtitleFile || asksSubtitleAddress || searchesSubtitles
     }
 
     private func keyboardAction(_ action: PlaybackKeyboard.Action) {
@@ -808,6 +819,8 @@ struct MobilePlayerView: View {
             // With Yingxia found on an Apple TV or Mac, one menu holds those and AirPlay.
             if tvBrowser.receivers.isEmpty && CastController.shared.devices.isEmpty {
                 AirPlayButton()
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
             } else {
                 PlayOnButton(channel: channel, session: session, browser: tvBrowser) { receiver in
                     session.player.pause()
@@ -1184,12 +1197,22 @@ struct WaitSpinner: View {
 }
 
 /// Whether a menu is open: SwiftUI's `Menu` opens UIKit's context menu, whose container joins the window while it
-/// shows. Read only when the player's controls are about to fade (#1500).
+/// shows. Read only when the player's controls are about to fade (#1500). The container is not always a subview of
+/// the window itself, so looking only at the window's own subviews can miss it, and the menu shut a few seconds
+/// after the last tap (#2341): the whole subtree is walked instead.
 @MainActor enum OpenMenu {
     static var showing: Bool {
         UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows).contains { window in
-            !window.isHidden && window.subviews.contains { String(describing: type(of: $0)).contains("ContextMenuContainer") }
+            !window.isHidden && containsContextMenu(in: window)
         }
+    }
+
+    private static func containsContextMenu(in view: UIView) -> Bool {
+        for subview in view.subviews where !subview.isHidden {
+            if String(describing: type(of: subview)).contains("ContextMenuContainer") { return true }
+            if containsContextMenu(in: subview) { return true }
+        }
+        return false
     }
 }
 
@@ -1235,11 +1258,16 @@ extension View {
     }
 }
 
+#endif
+
+// Shared with the Mac player, which draws the same controls (DesktopPlaybackView).
+#if !os(tvOS)
+
 /// The position and the length in a capsule over a scrubber the width of the screen, as in YouTube's player, and
 /// scrubbing as in Telegram's: while dragged, only the bar, the time and a frame from that point (above the handle)
 /// follow the finger, and the video seeks once, when the finger lifts. Seeking the playing video along with the finger
 /// left it stuttering behind. A view of its own, so only it redraws as the position moves.
-private struct SeekBar<Accessory: View>: View {
+struct SeekBar<Accessory: View>: View {
     /// The height of the time's row, which the accessory shares: the episode buttons are 36 points round.
     static var timeRow: CGFloat { 36 }
     let clock: PlayerClock
@@ -1410,6 +1438,10 @@ private struct SeekBar<Accessory: View>: View {
     }
 }
 
+#endif
+
+#if os(iOS)
+
 /// The top row's three parts: Back, the title and the buttons. All in one row while the title keeps `minimumTitle`;
 /// otherwise Back and the buttons share the first row and the title has the next one to itself. On a screen too
 /// narrow even for Back beside the buttons, the buttons take the first row alone and Back goes beside the title.
@@ -1471,8 +1503,13 @@ private struct PlayerTopBar: SwiftUI.Layout {
     }
 }
 
+#endif
+
+// Shared with the Mac player, which draws the same controls (DesktopPlaybackView).
+#if !os(tvOS)
+
 /// A round glass button of the given size, for play and skip in the middle of the picture.
-private struct PlayerCircleStyle: ButtonStyle {
+struct PlayerCircleStyle: ButtonStyle {
     var size: CGFloat
     @Environment(\.isEnabled) private var enabled
     @Environment(\.chromeGrouped) private var grouped
@@ -1490,18 +1527,63 @@ private struct PlayerCircleStyle: ButtonStyle {
     }
 }
 
-/// AirPlay, drawn like the buttons beside it: the system's own button (AVRoutePickerView) drew its mark bigger and heavier,
-/// so it stays out of sight and this one opens its picker, as Play On's menu does.
-private struct AirPlayButton: View {
-    @State private var airPlay = AirPlayPicker()
-    var body: some View {
-        Button(action: airPlay.present) {
-            Image(systemName: "airplay.video").font(.airPlayGlyph).frame(width: 22, height: 22)
+#endif
+
+#if os(iOS)
+
+/// AirPlay, drawn like the buttons beside it: the 15 pt mark, not the system's bigger, heavier one (#1560). All of it is
+/// UIKit: the system's button, all but invisible, takes the tap and opens its picker itself, with our mark on top. A
+/// SwiftUI mark over the hidden picker drew nothing on iPhones, only the picker's own faint mark (#2466).
+private struct AirPlayButton: UIViewRepresentable {
+    func makeUIView(context: Context) -> AirPlayMarkView { AirPlayMarkView() }
+    func updateUIView(_ view: AirPlayMarkView, context: Context) {}
+}
+
+private final class AirPlayMarkView: UIView {
+    private let picker = AVRoutePickerView()
+    private let mark = UIImageView(image: UIImage(systemName: "airplay.video",
+                                                  withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)))
+    /// As `ChromeButtonStyle` in a button group: a faint circle while pressed.
+    private let pressed = UIView()
+    private weak var button: UIButton?
+
+    init() {
+        super.init(frame: .zero)
+        picker.prioritizesVideoDevices = true
+        // 0.02, not 0: a view under 0.01 takes no touches.
+        picker.alpha = 0.02
+        pressed.backgroundColor = UIColor.white.withAlphaComponent(0.2)
+        pressed.alpha = 0
+        pressed.isUserInteractionEnabled = false
+        mark.tintColor = .white
+        mark.contentMode = .center
+        mark.isUserInteractionEnabled = false
+        for view in [pressed, picker, mark] as [UIView] {
+            view.frame = bounds
+            view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            addSubview(view)
         }
-        .chromeButton()
-        .background { AirPlayPickerView(picker: airPlay).opacity(0.02).allowsHitTesting(false) }
-        .accessibilityLabel(L10n.text("AirPlay"))
-        .accessibilityIdentifier("player.airPlay")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        pressed.layer.cornerRadius = min(bounds.width, bounds.height) / 2
+        guard button == nil else { return }
+        func find(in view: UIView) -> UIButton? { view as? UIButton ?? view.subviews.lazy.compactMap(find).first }
+        guard let found = find(in: picker) else { return }
+        button = found
+        found.accessibilityIdentifier = "player.airPlay"
+        found.addTarget(self, action: #selector(touchDown), for: [.touchDown, .touchDragEnter])
+        found.addTarget(self, action: #selector(touchEnded), for: [.touchUpInside, .touchUpOutside, .touchDragExit, .touchCancel])
+    }
+
+    // Not press()/release(): -release is NSObject's own, and overriding it recursed at once.
+    @objc private func touchDown() { highlight(true) }
+    @objc private func touchEnded() { highlight(false) }
+    private func highlight(_ on: Bool) {
+        pressed.alpha = on ? 1 : 0
+        mark.alpha = on ? 0.72 : 1
     }
 }
 
@@ -1907,6 +1989,11 @@ private struct BatteryGauge: View {
     }
 }
 
+#endif
+
+// Shared with the Mac player, which draws the same controls (DesktopPlaybackView).
+#if !os(tvOS)
+
 /// The playing item's position and duration, four times a second while it plays.
 @MainActor @Observable final class PlayerClock {
     private(set) var position: Double = 0
@@ -1937,6 +2024,7 @@ private struct BatteryGauge: View {
         token = nil
         loading = nil
         dropReader()
+        dropPreviewAsset()
     }
 
     /// The player's position now, read without waiting for the next tick.
@@ -1949,6 +2037,8 @@ private struct BatteryGauge: View {
     private(set) var preview: CGImage?
     @ObservationIgnored private var generator: AVAssetImageGenerator?
     @ObservationIgnored private var generatorItem: ObjectIdentifier?
+    /// The generator's asset when it is a drive file's preview asset (`dropPreviewAsset`).
+    @ObservationIgnored private var previewAsset: AVAsset?
     /// An item AVFoundation made no frame from (an HLS stream, say): no more tries for it.
     @ObservationIgnored private var previewless: ObjectIdentifier?
     @ObservationIgnored private var generating = false
@@ -1996,6 +2086,7 @@ private struct BatteryGauge: View {
                 if !Task.isCancelled { self?.dropReader() }
             }
         }
+        dropPreviewAsset()
         let tolerance = SeekTolerance.release(secondsPerPoint: scrubPrecision)
         scrubPrecision = 0
         if let target = scrubbing { seek(to: target, tolerance: tolerance) }
@@ -2029,7 +2120,11 @@ private struct BatteryGauge: View {
             return readStream(seconds, from: reader.reader, of: identity)
         }
         if generatorItem != identity {
-            let generator = AVAssetImageGenerator(asset: item.asset)
+            dropPreviewAsset()
+            // A drive file's frames come from an asset of their own, which reads only what they show (`CloudStreams.previewAsset`).
+            let cloud = (item.asset as? AVURLAsset).flatMap { CloudStreams.previewAsset(for: $0.url) }
+            previewAsset = cloud
+            let generator = AVAssetImageGenerator(asset: cloud ?? item.asset)
             generator.appliesPreferredTrackTransform = true
             generator.maximumSize = CGSize(width: 320, height: 320)
             generator.requestedTimeToleranceBefore = CMTime(seconds: 2, preferredTimescale: 600)
@@ -2040,11 +2135,14 @@ private struct BatteryGauge: View {
         guard let generator else { return }
         nextPreview = nil
         generating = true
+        let asked = ObjectIdentifier(generator)
         generator.generateCGImageAsynchronously(for: CMTime(seconds: seconds, preferredTimescale: 600)) { [weak self] image, _, _ in
             nonisolated(unsafe) let frame = image
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.generating = false
+                // Let go at the end of the drag (`dropPreviewAsset`), which calls off what it was reading.
+                guard self.generator.map(ObjectIdentifier.init) == asked else { return self.makePreview() }
                 if let frame { if self.scrubbing != nil { self.preview = frame } }
                 else if self.preview == nil {
                     // No frame from the generator: a stream. Its second reader takes over where one may open.
@@ -2096,6 +2194,17 @@ private struct BatteryGauge: View {
         }
     }
 
+    /// A drive file's preview asset and its generator, let go when the finger lifts: its reads are called off, so none
+    /// goes on downloading from a dragged place while the video waits for the place it landed. The next drag opens
+    /// another (its index is still in the stream's cache).
+    private func dropPreviewAsset() {
+        guard let asset = previewAsset else { return }
+        previewAsset = nil
+        generator = nil
+        generatorItem = nil
+        CloudStreams.endPreview(asset)
+    }
+
     private func dropReader() {
         readerIdle?.cancel(); readerIdle = nil
         guard let reader else { return }
@@ -2111,6 +2220,7 @@ private struct BatteryGauge: View {
             item = player.currentItem
             buffered = 0
             dropReader()
+            dropPreviewAsset()
             loading = item?.observe(\.loadedTimeRanges, options: [.new]) { [weak self] _, _ in
                 Task { @MainActor [weak self] in self?.measureLoaded() }
             }
@@ -2134,6 +2244,10 @@ private struct BatteryGauge: View {
         if abs(value - buffered) >= 1 || (value == 0) != (buffered == 0) { buffered = value }
     }
 }
+
+#endif
+
+#if os(iOS)
 
 /// The video on the Lock Screen, in Control Center and on headphones, with play, pause, skip and scrub: AVKit's
 /// own player published these by itself. Music holds Now Playing only while no video plays (MusicRemoteControl).
