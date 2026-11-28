@@ -94,6 +94,10 @@ struct MobilePlayerView: View {
     @AppStorage(PictureLevel.key) private var slidesLevels = true
     /// Off, as it starts (#1745): two taps anywhere play or pause, and the sides don't skip.
     @AppStorage(PictureDoubleTap.key) private var doubleTapSkips = PictureDoubleTap.standard
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+    /// Two taps on a side skip right now: the setting is on, and the picture takes taps (not cast, not floating,
+    /// and not under VoiceOver, which can't reach the tap zones).
+    private var tapsSkip: Bool { doubleTapSkips && playingOn == nil && !pip.active && !voiceOver }
     /// The lock button's edge (#1922), the tags over the seek bar (#1534) and Picture in Picture (#1731), from Settings.
     @AppStorage(LockButtonSide.key) private var lockSide = LockButtonSide.left.rawValue
     @AppStorage(PlaybackTags.key) private var showsTags = true
@@ -120,9 +124,13 @@ struct MobilePlayerView: View {
 
     var body: some View {
         ZStack {
-            PlayerLayerView(player: session.player, gravity: videoFill.gravity, pip: pip).playerBleed(!inline)
-                // Picture in Picture shows only the player's layer, so AVPlayer draws the subtitles there.
-                .onChange(of: pip.active) { _, active in session.subtitles.native = active }
+            PlayerLayerView(player: session.player, gravity: videoFill.gravity, pip: pip) { session.setDisplayReady($0) }.playerBleed(!inline)
+                // Picture in Picture shows only the player's layer, so AVPlayer draws the subtitles there and the
+                // ML enhancer steps aside while PiP runs.
+                .onChange(of: pip.active) { _, active in
+                    session.subtitles.native = active
+                    session.enhancer.suspended = active
+                }
                 // Playing in its window or on another device: the seek bar's preview opens no second reader (#1600).
                 .onChange(of: pip.active || playingOn != nil, initial: true) { _, away in clock.streamPreviews = !away }
                 .onChange(of: allowsPictureInPicture, initial: true) { _, allowed in pip.startsWhenLeaving = allowed }
@@ -205,7 +213,7 @@ struct MobilePlayerView: View {
         }
         // In with a fade; out at once, so the first frame replaces the wait with no pause or crossfade.
         .animation(waiting == nil ? nil : .easeInOut(duration: 0.7), value: waiting == nil)
-        .animation(waiting == nil ? nil : .easeInOut(duration: 0.4), value: waiting?.starting)
+        .animation(waiting?.starting == true ? .easeInOut(duration: 0.4) : nil, value: waiting?.starting)
         .onChange(of: session.showsPicture ? session.subtitles.pictureSize : .zero, initial: true) { _, size in
             guard !decidedCacheOrientation, layout == .screen, channel.url.scheme == DownloadLibrary.scheme,
                   PlayerOrientation.available, horizontalSizeClass == .compact || verticalSizeClass == .compact,
@@ -591,7 +599,7 @@ struct MobilePlayerView: View {
             // Locked, the button says what it undoes: with every control hidden, a bare padlock left people stuck
             // in a player that seemed frozen (#729, #731).
             HStack(spacing: 8) {
-                Image(systemName: locked ? "lock.fill" : "lock.open.fill").font(.headline).frame(width: 22, height: 22)
+                Image(systemName: locked ? "lock.fill" : "lock.open.fill").font(.playerGlyph).frame(width: 24, height: 24)
                     .contentTransition(.symbolEffect(.replace))
                 if locked { Text(L10n.text("Unlock Controls")).font(.subheadline.weight(.semibold)).fixedSize() }
             }
@@ -754,7 +762,7 @@ struct MobilePlayerView: View {
     @ViewBuilder private var topRow: some View {
         if inline {
             HStack(spacing: 8) {
-                Button(action: close) { Image(systemName: "chevron.backward").font(.headline).frame(width: 22, height: 22) }
+                Button(action: close) { Image(systemName: "chevron.backward").font(.playerGlyph).frame(width: 24, height: 24) }
                     .chromeButton(reach: 8)
                     .accessibilityLabel(L10n.text("Back"))
                     .accessibilityIdentifier("player.close")
@@ -770,7 +778,7 @@ struct MobilePlayerView: View {
     private var screenTopRow: some View {
         PlayerTopBar {
             // The way out takes a touch that only comes near it (#1149): 64 points around its 44-point circle.
-            Button(action: close) { Image(systemName: "chevron.backward").font(.headline).frame(width: 22, height: 22) }
+            Button(action: close) { Image(systemName: "chevron.backward").font(.playerGlyph).frame(width: 24, height: 24) }
                 .chromeButton(reach: 10)
                 .accessibilityLabel(L10n.text("Back"))
                 .accessibilityIdentifier("player.close")
@@ -829,15 +837,13 @@ struct MobilePlayerView: View {
             }
             if pip.supported && allowsPictureInPicture {
                 Button { pip.toggle() } label: {
-                    Image(systemName: pip.active ? "pip.exit" : "pip.enter").font(.headline).frame(width: 22, height: 22)
+                    Image(systemName: pip.active ? "pip.exit" : "pip.enter").font(.playerGlyph).frame(width: 24, height: 24)
                 }
                 .chromeButton()
                 .disabled(!pip.possible && !pip.active)
                 .accessibilityLabel(L10n.text("Picture in Picture"))
                 .accessibilityIdentifier("player.pip")
             }
-            // On a watch page the episodes are on the page itself.
-            if !inline { CatalogPlaybackActions(channel: channel, session: session) }
             Menu {
                 Toggle(isOn: $showsDanmaku) { Label(L10n.text("Show Danmaku"), systemImage: "text.bubble") }
                 Button { showsDanmakuSettings = true } label: { Label(L10n.text("Danmaku Settings…"), systemImage: "slider.horizontal.3") }
@@ -850,7 +856,8 @@ struct MobilePlayerView: View {
                     .disabled(session.danmaku.isEmpty)
             } label: {
                 // A wide, tall mark: a size down it sits level with AirPlay and the options beside it.
-                Image(systemName: DanmakuPreference.symbol).font(.system(size: 16, weight: .semibold)).frame(width: 22, height: 22)
+                // A text bubble, filled while comments show: the state at a glance. Here no subtitles bubble sits beside it.
+                Image(systemName: showsDanmaku ? "text.bubble.fill" : "text.bubble").font(.playerGlyph).frame(width: 24, height: 24)
             }
             .chromeButton()
             .accessibilityLabel(L10n.text("Danmaku"))
@@ -863,7 +870,7 @@ struct MobilePlayerView: View {
                     decidedCacheOrientation = true
                     PlayerOrientation.set(landscape: !landscape)
                 } label: {
-                    Image(systemName: landscape ? "rectangle.portrait.rotate" : "rectangle.landscape.rotate").font(.headline).frame(width: 22, height: 22)
+                    Image(systemName: landscape ? "rectangle.portrait.rotate" : "rectangle.landscape.rotate").font(.playerGlyph).frame(width: 24, height: 24)
                 }
                 .chromeButton()
                 .accessibilityLabel(L10n.text(landscape ? "Rotate to Portrait" : "Rotate to Landscape"))
@@ -878,6 +885,8 @@ struct MobilePlayerView: View {
     /// The picture, sound and subtitle settings in one menu: what AVKit's ⋯ menu held, and the stream's quality.
     private var optionsMenu: some View {
         Menu {
+            // What the catalog's own ⋯ menu held, one button fewer (on a watch page the page has them).
+            if !inline { Section { CatalogPlaybackItems(channel: channel, session: session) } }
             if session.qualities.count > 1 { Menu(L10n.text("Quality")) { QualityPicker(session: session) } }
             if pictureSwitches {
                 Section(L10n.text("Picture")) {
@@ -885,19 +894,19 @@ struct MobilePlayerView: View {
                     if VideoEnhancement.canUpscale { Toggle(L10n.text("Sharper Picture"), isOn: $upscalesVideo) }
                 }
             }
-            if let audio = tracks.audio, audio.options.count > 1 {
-                Menu(L10n.text("Audio")) {
-                    Picker(L10n.text("Audio"), selection: Binding(get: { tracks.selected(in: audio) }, set: { tracks.select($0, in: audio) })) {
-                        ForEach(audio.options, id: \.self) { Text(audio.name($0)).tag(Optional($0)) }
-                    }
-                    .pickerStyle(.inline)
-                }
-            }
-            // A file whose sound tracks AVFoundation offers no choice between (#428).
+            // A file whose sound tracks AVFoundation offers no complete choice between (#428, #1694), else the
+            // item's audible media selection group.
             if session.audioChoices.count > 1 {
                 Menu(L10n.text("Audio")) {
                     Picker(L10n.text("Audio"), selection: Binding(get: { session.audioChoice }, set: { if let id = $0 { session.chooseAudio(id) } })) {
                         ForEach(session.audioChoices) { Text($0.name).tag(Optional($0.id)) }
+                    }
+                    .pickerStyle(.inline)
+                }
+            } else if let audio = tracks.audio, audio.options.count > 1 {
+                Menu(L10n.text("Audio")) {
+                    Picker(L10n.text("Audio"), selection: Binding(get: { tracks.selected(in: audio) }, set: { if let option = $0 { session.chooseAudioTrack(option, in: audio.group) } })) {
+                        ForEach(audio.options, id: \.self) { Text(audio.name($0)).tag(Optional($0)) }
                     }
                     .pickerStyle(.inline)
                 }
@@ -937,7 +946,10 @@ struct MobilePlayerView: View {
                 }
             }
             // A series' intro and outro (#1488), here with the player's other settings, on the video page too.
-            if session.canSkip, !session.isLive { SkipTimesMenuButton(session: session) { showsSkip = true } }
+            if session.canSkip, !session.isLive {
+                SkipTimesMenuButton(session: session) { showsSkip = true }
+                Toggle(L10n.text("Look Up Intro and Outro Times Online"), isOn: Binding(get: { session.looksUpSkipsOnline }, set: { session.looksUpSkipsOnline = $0 }))
+            }
             SleepTimerMenu(item: .episode, offersEnd: !session.isLive)
             Picker(selection: $videoFill) {
                 ForEach(VideoFill.allCases, id: \.self) { Label($0.title, systemImage: $0.symbol).tag($0) }
@@ -955,11 +967,10 @@ struct MobilePlayerView: View {
                 if showsStatus { Toggle(L10n.text("Battery Percentage"), isOn: $batteryPercentage) }
             }
         } label: {
-            Image(systemName: "slider.horizontal.3").font(.headline).frame(width: 22, height: 22)
+            Image(systemName: "gearshape").font(.playerGlyph).frame(width: 24, height: 24)
                 .symbolVariant(pictureSwitches && (upscalesVideo || smoothsVideo) ? .fill : .none)
         }
         .chromeButton()
-        // "Playback Options" is the catalog's episode menu beside it.
         .accessibilityLabel(L10n.text("Settings"))
         .accessibilityIdentifier("player.options")
     }
@@ -971,9 +982,11 @@ struct MobilePlayerView: View {
 
     // MARK: Middle and bottom
 
+    /// The middle row: play/pause, with skip buttons beside it — unless two taps on a side already skip (#2061),
+    /// in which case the buttons would only duplicate the gesture.
     private var centerRow: some View {
         HStack(spacing: 20) {
-            if seekable && !inline {
+            if seekable && !inline && !tapsSkip {
                 let step = SkipInterval.seconds(skipInterval)
                 Button { session.skip(-step); sought() } label: { Image(systemName: SkipInterval.symbol(forward: false, seconds: step)) }
                     .buttonStyle(PlayerCircleStyle(size: 52))
@@ -986,7 +999,7 @@ struct MobilePlayerView: View {
                 .buttonStyle(PlayerCircleStyle(size: inline ? 50 : 68))
                 .accessibilityLabel(L10n.text(session.paused ? "Play" : "Pause"))
                 .accessibilityIdentifier("player.playPause")
-            if seekable && !inline {
+            if seekable && !inline && !tapsSkip {
                 let step = SkipInterval.seconds(skipInterval)
                 Button { session.skip(step); sought() } label: { Image(systemName: SkipInterval.symbol(forward: true, seconds: step)) }
                     .buttonStyle(PlayerCircleStyle(size: 52))
@@ -1542,7 +1555,7 @@ private struct AirPlayButton: UIViewRepresentable {
 private final class AirPlayMarkView: UIView {
     private let picker = AVRoutePickerView()
     private let mark = UIImageView(image: UIImage(systemName: "airplay.video",
-                                                  withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)))
+                                                  withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .medium)))
     /// As `ChromeButtonStyle` in a button group: a faint circle while pressed.
     private let pressed = UIView()
     private weak var button: UIButton?
@@ -1686,16 +1699,41 @@ private struct PlayerLayerView: UIViewRepresentable {
     let player: AVPlayer
     let gravity: AVLayerVideoGravity
     let pip: PictureInPicture
+    var onReadyForDisplay: @MainActor (Bool) -> Void = { _ in }
+    @MainActor final class Coordinator {
+        var observation: NSKeyValueObservation?
+        var onReadyForDisplay: @MainActor (Bool) -> Void = { _ in }
+        weak var layer: AVPlayerLayer?
+        func watch(_ layer: AVPlayerLayer) {
+            guard self.layer !== layer else { return }
+            self.layer = layer
+            observation = layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] _, change in
+                let ready = change.newValue ?? false
+                Task { @MainActor [weak self] in self?.onReadyForDisplay(ready) }
+            }
+        }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
     func makeUIView(context: Context) -> PlayerLayerUIView {
-        if let kept = pip.layerView, kept.superview == nil, kept.playerLayer.player === player { return kept }
+        context.coordinator.onReadyForDisplay = onReadyForDisplay
+        if let kept = pip.layerView, kept.superview == nil, kept.playerLayer.player === player {
+            context.coordinator.watch(kept.playerLayer)
+            return kept
+        }
         let view = PlayerLayerUIView()
         view.playerLayer.player = player
         pip.attach(view)
+        context.coordinator.watch(view.playerLayer)
         return view
     }
     func updateUIView(_ view: PlayerLayerUIView, context: Context) {
+        context.coordinator.onReadyForDisplay = onReadyForDisplay
         if view.playerLayer.player !== player { view.playerLayer.player = player }
         view.playerLayer.videoGravity = gravity
+        context.coordinator.watch(view.playerLayer)
+    }
+    static func dismantleUIView(_ view: PlayerLayerUIView, coordinator: Coordinator) {
+        coordinator.observation = nil
     }
 }
 
@@ -1831,9 +1869,10 @@ private struct BatteryGauge: View {
 @MainActor @Observable final class PictureInPicture: NSObject, AVPictureInPictureControllerDelegate {
     let supported = AVPictureInPictureController.isPictureInPictureSupported()
     private(set) var possible = false
-    private(set) var active = false
-    /// The window is up (from its start until it closes): the player screen can go, and the video plays on in it.
-    private(set) var floating = false
+    private(set) var state = MobilePiPState()
+    var active: Bool { state.active }
+    /// The window is up over the app (started from the player's button): the player screen can go while it floats.
+    var floating: Bool { state.floating }
     /// The view of the layer the window shows, kept for a player screen opened again while it floats.
     @ObservationIgnored private(set) var layerView: PlayerLayerUIView?
     @ObservationIgnored private var controller: AVPictureInPictureController?
@@ -1868,7 +1907,12 @@ private struct BatteryGauge: View {
 
     func toggle() {
         guard let controller else { return }
-        if controller.isPictureInPictureActive { controller.stopPictureInPicture() } else { controller.startPictureInPicture() }
+        if controller.isPictureInPictureActive {
+            controller.stopPictureInPicture()
+        } else {
+            state.beginManualStart()
+            controller.startPictureInPicture()
+        }
     }
 
     /// Brings the video back from the window into its player.
@@ -1876,16 +1920,26 @@ private struct BatteryGauge: View {
         if controller?.isPictureInPictureActive == true { controller?.stopPictureInPicture() }
     }
 
+    /// Switching back to Yingxia via the home bar or app switcher after automatic PiP returns the video straight
+    /// into the open player instead of leaving it floating over the app (#2441, #2483).
+    func returnIfAutomatic() {
+        guard state.shouldStopOnAppActive() else { return }
+        stop()
+    }
+
     nonisolated func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
-        Task { @MainActor [weak self] in self?.active = true }
+        Task { @MainActor [weak self] in self?.state.willStart() }
     }
     nonisolated func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
-        Task { @MainActor [weak self] in self?.floating = true }
+        Task { @MainActor [weak self] in self?.state.didStart() }
+    }
+    nonisolated func pictureInPictureControllerWillStopPictureInPicture(_ controller: AVPictureInPictureController) {
+        Task { @MainActor [weak self] in self?.state.willStop() }
     }
     nonisolated func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            active = false; floating = false
+            state.didStop()
             FloatingPlayback.shared.stopped(self)
         }
     }
@@ -1900,7 +1954,10 @@ private struct BatteryGauge: View {
     }
     nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
         let detail = Diagnostics.describe(error)
-        Task { @MainActor in Diagnostics.shared.record(.warning, "player", "Picture in Picture failed: \(detail)") }
+        Task { @MainActor [weak self] in
+            self?.state.didFailToStart()
+            Diagnostics.shared.record(.warning, "player", "Picture in Picture failed: \(detail)")
+        }
     }
 }
 
@@ -1914,6 +1971,9 @@ private struct BatteryGauge: View {
         let channel: Channel
         let session: PlaybackSession
         let pip: PictureInPicture
+        /// The player was turned landscape before it floated (#2483): closing the screen drops the turn
+        /// (`PlayerOrientation.release()` on disappear), so it is carried here and put back on return.
+        let landscape: Bool
     }
     private(set) var parked: Parked?
     private weak var store: Store?
@@ -1923,7 +1983,7 @@ private struct BatteryGauge: View {
     /// The player screen is closing while its window floats: the session plays on in it.
     func park(_ channel: Channel, session: PlaybackSession, pip: PictureInPicture, store: Store) {
         if let parked, parked.session !== session { end() }
-        parked = Parked(channel: channel, session: session, pip: pip)
+        parked = Parked(channel: channel, session: session, pip: pip, landscape: PlayerOrientation.mask == .landscape)
         self.store = store
         // The window plays on into the next episode as the player does (#1719, #2127), but nothing opens over the app:
         // the queue moves on inside the window, and the window's return to the app opens the player on the episode it
@@ -1936,7 +1996,7 @@ private struct BatteryGauge: View {
         session.onAdvance = { [weak self, weak store, weak session] next in
             guard let self, let parked = self.parked, parked.session === session else { return }
             store?.followFloating(to: next, from: parked.channel)
-            self.parked = Parked(channel: next, session: parked.session, pip: parked.pip)
+            self.parked = Parked(channel: next, session: parked.session, pip: parked.pip, landscape: parked.landscape)
         }
     }
 
@@ -1945,14 +2005,17 @@ private struct BatteryGauge: View {
     /// The video floating, for a player screen opening on `channel`.
     func parked(for channel: Channel) -> Parked? { parked?.channel == channel ? parked : nil }
 
-    /// A player screen opened with the floating session: it is the screen's again. False for any other session.
-    func take(_ session: PlaybackSession) -> Bool {
-        guard let parked, parked.session === session else { return false }
+    /// A player screen opened with the floating session: it is the screen's again, and the caller learns whether it
+    /// was turned landscape before it floated (#2483). Nil for any other session, or when the floating session failed
+    /// while parked: it is ended here, in `.onAppear`, not in `init`, so the reopened player starts fresh (#1642).
+    func take(_ session: PlaybackSession) -> Parked? {
+        guard let parked, parked.session === session else { return nil }
+        guard parked.session.error == nil else { end(); return nil }
         self.parked = nil
         // Opened from the app rather than the window's button: the video comes back from the window.
         if restoring == nil { parked.pip.stop() }
         finishRestoring()
-        return true
+        return parked
     }
 
     /// The window's return button: the player opens again on the video. With the player still open there's nothing to do.
@@ -1986,6 +2049,50 @@ private struct BatteryGauge: View {
         finishRestoring()
         parked.pip.stop()
         parked.session.stop()
+    }
+}
+
+/// Carries a live playback session across a watch-page to full-screen layout switch (unfolding iPhone Duo to its
+/// inner display, #1967, #1528, #2103) without stopping or reloading the stream.
+@MainActor final class PlaybackHandoff {
+    static let shared = PlaybackHandoff()
+    struct Entry {
+        let channel: Channel
+        let session: PlaybackSession
+        let pip: PictureInPicture
+    }
+    private var entry: Entry?
+    private var expiry: Task<Void, Never>?
+
+    /// Holds `session` briefly for the replacement `PlaybackView`; stops it if nothing claims it.
+    func park(_ channel: Channel, session: PlaybackSession, pip: PictureInPicture) {
+        if let existing = entry, existing.session !== session { existing.session.stop() }
+        entry = Entry(channel: channel, session: session, pip: pip)
+        expiry?.cancel()
+        expiry = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, let self, let pending = self.entry, pending.session === session else { return }
+            self.entry = nil
+            pending.session.stop()
+        }
+    }
+
+    func holds(_ session: PlaybackSession) -> Bool { entry?.session === session }
+
+    func peek(for channel: Channel) -> Entry? { entry?.channel == channel ? entry : nil }
+
+    func take(_ session: PlaybackSession) -> Bool {
+        guard entry?.session === session else { return false }
+        entry = nil
+        expiry?.cancel(); expiry = nil
+        return true
+    }
+
+    func discard() {
+        expiry?.cancel(); expiry = nil
+        let pending = entry
+        entry = nil
+        pending?.session.stop()
     }
 }
 

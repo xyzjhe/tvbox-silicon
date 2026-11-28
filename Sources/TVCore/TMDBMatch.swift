@@ -188,6 +188,8 @@ public enum TMDBMatch {
     public struct Details: Codable, Hashable, Sendable {
         public let mediaType: MediaType
         public let id: Int
+        /// IMDb's title ID, when TMDB knows it. Absent in older cached details.
+        public var imdbID: String? = nil
         public let name: String
         public let originalName: String
         public let tagline: String
@@ -217,6 +219,9 @@ public enum TMDBMatch {
         /// "You may like": TMDB's recommendations, then similar titles. Absent in details saved before it was added.
         public let recommendations: [Candidate]?
         public let link: URL
+        /// Every other name TMDB lists for the work, for matching sources that list it under one of them (#2608).
+        /// Absent in details saved before it was added. A `var`: a `let` with a default value is never decoded.
+        public var otherNames: [String]? = nil
     }
 
     public struct Match: Codable, Hashable, Sendable {
@@ -275,7 +280,7 @@ public enum TMDBMatch {
     public static func details(_ type: MediaType, id: Int, season: Int?, language: String = TMDBMatch.language, session: URLSession = .shared) async throws -> Details {
         var parts = URLComponents(url: base.appending(path: "details"), resolvingAgainstBaseURL: false)!
         parts.queryItems = [URLQueryItem(name: "type", value: type.rawValue), URLQueryItem(name: "id", value: String(id)),
-                            URLQueryItem(name: "language", value: language), URLQueryItem(name: "v", value: "4")] + (season.map { [URLQueryItem(name: "season", value: String($0))] } ?? [])
+                            URLQueryItem(name: "language", value: language), URLQueryItem(name: "v", value: "5")] + (season.map { [URLQueryItem(name: "season", value: String($0))] } ?? [])
         return try await get(Details.self, parts.url!, session: session)
     }
 
